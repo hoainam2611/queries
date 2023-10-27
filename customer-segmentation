@@ -1,0 +1,166 @@
+with 
+calendar as
+  (
+    select 
+      distinct last_day(date, month) as end_of_month, 
+      date_trunc(date,month) as start_of_month
+    from unnest(generate_date_array('2021-01-01', current_date("Asia/Ho_Chi_Minh"))) as date 
+  ),
+customer as 
+  (
+    select
+      distinct phone, 
+      start_of_month,
+      end_of_month
+    from 
+    (
+      select
+        salesorder.phone,
+        start_of_month,
+        min(date(trandate)) over(partition by phone order by trandate ) create_date,
+        calendar.end_of_month
+      from
+        `dbt-hoainam.OP_Sales.SalesOrder` salesorder
+      cross join  calendar
+      where 
+        1=1 
+        and lower(salesorder.customer_name) not like '%temp tiki%'
+        and lower(salesorder.customer_name) not like '%c-00025639%'
+        and salesorder.phone not like '1800%'
+        and salesorder.tranid not like 'SOHNIWN-KC%'
+        and salesorder.tranid not like 'SOHNIWS-KC%'
+        and salesorder.net_amount <> 0 
+    )
+    where 1=1 
+    and end_of_month >= date(last_day(create_date, month))
+  ),
+salesorder as 
+  (  
+    select 
+      distinct phone,
+      new_id,
+      date(trandate) as trandate, 
+      date(last_day(date(trandate), month)) as end_of_month, 
+      date_trunc(date(trandate),month) as start_of_month, 
+      sum(net_amount) as net_amount 
+    from `dbt-hoainam.OP_Sales.SalesOrder`  salesorder 
+    where 
+      1=1 
+      and lower(salesorder.customer_name) not like '%temp tiki%'
+      and lower(salesorder.customer_name) not like '%c-00025639%'
+      and salesorder.phone not like '1800%'
+      and salesorder.tranid not like 'SOHNIWN-KC%'
+      and salesorder.tranid not like 'SOHNIWS-KC%'
+      and salesorder.net_amount <> 0 
+    group by 1,2,3,4,5
+  ),
+salesorder_1 as
+  (
+    select 
+      distinct phone, 
+      start_of_month, 
+      end_of_month, 
+      concat(phone, salesorder.start_of_month) as phone_month_id, 
+      max(trandate) as last_trandate_in_month,
+      sum(net_amount) as net_amount
+    from salesorder
+    group by 1,2,3,4
+  ),
+salesorder_2 as 
+  (
+    select 
+      customer.phone,
+      customer.start_of_month,
+      customer.end_of_month, 
+      concat(customer.phone, customer.start_of_month) as phone_month_id,
+      salesorder_1.last_trandate_in_month, 
+      case
+        when last_trandate_in_month is not null then last_trandate_in_month
+        else max(last_trandate_in_month) over(partition by customer.phone order by customer.start_of_month rows between unbounded preceding and current row) end as last_order,
+      salesorder_1.net_amount,
+    from customer 
+    left join salesorder_1 
+      on (customer.phone = salesorder_1.phone and customer.end_of_month = salesorder_1.end_of_month)
+  ), 
+segment as
+  (
+    select 
+      phone, 
+      start_of_month,
+      end_of_month, 
+      phone_month_id,
+      last_order,
+      date_diff(end_of_month, last_order, day) as r, 
+      count(last_trandate_in_month) over (partition by phone order by end_of_month) as f, 
+      sum(net_amount) over (partition by phone order by end_of_month) as m 
+    from salesorder_2
+  ), 
+rfm as 
+  (
+    select 
+      phone, 
+      end_of_month,
+      start_of_month, 
+      phone_month_id,
+      last_order, 
+      r,
+      f,
+      m,
+      case 
+        when r <= 30 then 5 
+        when r <= 90 then 4
+        when r <= 180 then 3
+        when r <= 365 then 2
+        when r > 365 then 1 
+        end as r_score, 
+      -- ntile(5) over(partition by start_of_month order by f) as f_score, 
+      case 
+        when f = 1 then 1
+        when f = 2 then 2
+        when f = 3 then 3
+        when f = 4 then 4
+        when f >= 5 then 5
+        end as f_score,
+      ntile(5) over(partition by start_of_month order by m) as m_score,
+      concat
+        (
+        case 
+          when r <= 30 then 5 
+          when r <= 90 then 4
+          when r <= 180 then 3
+          when r <= 365 then 2
+          when r > 365 then 1 
+          end,
+        -- ntile(5) over(partition by start_of_month order by f),
+        case 
+          when f = 1 then 1
+          when f = 2 then 2
+          when f = 3 then 3
+          when f = 4 then 4
+          when f >= 5 then 5
+          end, 
+        ntile(5) over(partition by start_of_month order by m)
+        ) as rfm_group
+    from segment
+  )
+select 
+  rfm.phone, 
+  rfm.end_of_month, 
+  rfm.start_of_month,
+  phone_month_id,
+  last_order, 
+  r,
+  f,
+  m,
+  r_score, 
+  f_score, 
+  m_score,
+  cast(rfm_group as int64 ) as rfm_group, 
+  cast(lag(rfm.rfm_group,1) over(partition by phone order by start_of_month) as int64) as rfm_1, 
+  cast(lag(rfm.rfm_group,3) over(partition by phone order by start_of_month) as int64) as rfm_3, 
+  cast(lag(rfm.rfm_group,6) over(partition by phone order by start_of_month) as int64) as rfm_6, 
+  cast(lag(rfm.rfm_group,12) over(partition by phone order by start_of_month) as int64) as rfm_12
+from rfm
+where
+  1=1
+order by phone, start_of_month desc
