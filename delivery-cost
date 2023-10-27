@@ -1,0 +1,67 @@
+with 
+products as
+(
+select 
+  distinct id, 
+  raw_sku_id,
+  name, 
+  safe_cast(json_extract_scalar(attributes, '$.pack_height') as numeric)        as pack_height, 
+  safe_cast(json_extract_scalar(attributes, '$.pack_width') as numeric)         as pack_width, 
+  safe_cast(json_extract_scalar(attributes, '$.pack_length') as numeric)        as pack_length, 
+  safe_cast(json_extract_scalar(attributes, '$.pack_weight') as numeric)        as pack_weight, 
+  safe_cast(json_extract_scalar(attributes, '$.pack_height') as numeric)
+    * safe_cast(json_extract_scalar(attributes, '$.pack_width') as numeric) 
+    * safe_cast(json_extract_scalar(attributes, '$.pack_length') as numeric)    as volume,
+  safe_divide(
+    (cast(json_extract_scalar(attributes, '$.pack_height') as numeric)
+    * cast(json_extract_scalar(attributes, '$.pack_width') as numeric) 
+    * cast(json_extract_scalar(attributes, '$.pack_length') as numeric)), 1000000)      as volume_m3,
+  safe_divide(cast(json_extract_scalar(attributes, '$.pack_weight') as numeric), 1000)  as weight_kg 
+from `dim_product_v2`
+where 1=1 
+and merchant_id = 1
+), 
+order_leadtime as 
+(
+select 
+  coalesce(coalesce(orders.om_order_code, orders.parent_id), transactions.trace_doc_id) as order_code, 
+  avg(safe_divide(timestamp_diff(ifnull(processing.delivered_at, completed.delivered_at),transactions.created_at,hour),24)) as lead_time
+from `fact_warehouse_transaction_v2`               transactions 
+left join `fact_order_created_v2`                  orders      on transactions.trace_order_id = orders.order_id 
+left join `dim_order_processing_v2`                processing  on orders.order_id = processing.order_id
+left join `fact_order_completed_v2`                completed   on orders.order_id = completed.order_id
+where 1=1 
+and transactions.order_type = 'export_order'
+and transactions.doc_type = 'out'
+and transactions.created_date >= '2023-05-01'
+and timestamp_diff(ifnull(processing.delivered_at, completed.delivered_at),transactions.created_at,hour) >=1
+and transactions.merchant_id = 1 
+group by 1
+)
+select 
+  coalesce(coalesce(orders.om_order_code, orders.parent_id), transactions.trace_doc_id) as order_code, 
+  transactions.order_type,
+  order_leadtime.lead_time,
+  count(distinct details.sku_id)    as num_sku,
+  sum(details.quantity)             as quantity, 
+  sum(details.quantity*products.volume)              as volume, 
+  sum(details.quantity*products.volume_m3)           as volume_m3,
+  sum(details.quantity*products.weight_kg)           as weight_kg,
+  case 
+    when transactions.order_type = 'transfer_order' then sum(cogs.weighted_cogs_per_unit_novat * details.quantity)
+    else sum(amount_novat) 
+    end as amount_novat
+from `fact_warehouse_transaction_v2`               transactions 
+left join `fact_warehouse_transaction_detail_v2`   details     on transactions.tran_id = details.tran_id
+left join `fact_order_created_v2`                  orders      on transactions.trace_order_id = orders.order_id 
+left join products                                            products    on details.sku_id = products.id
+left join `order_cogs`                 cogs        on details.sku_id = cogs.sku_id 
+                                                                          and transactions.created_date = cogs.date 
+                                                                          and transactions.merchant_id = cogs.merchant_id 
+left join order_leadtime on  coalesce(coalesce(orders.om_order_code, orders.parent_id), transactions.trace_doc_id) = order_leadtime.order_code   
+where 1=1 
+  and transactions.merchant_id = 1
+  and transactions.created_date >= '2023-05-01'
+  and transactions.order_type in ('export_order', 'purchase_order', 'transfer_order','po_return')
+  and transactions.doc_type in ('in','to_out','out','in_return')
+group by 1,2,3
