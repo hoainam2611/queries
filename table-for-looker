@@ -1,0 +1,444 @@
+with
+ 
+h01 as 
+(
+    select
+        a.id_new,
+        a.ward_name,
+        a.district_name,
+        a.province_name, 
+        a.region,
+        b.id_old
+    from 
+        (
+            select 
+                id as id_new, 
+                ward_name, 
+                district_code, 
+                district_name,
+                province_name, 
+                region
+            from  hive.comp_base.dim_location_v1  
+            where 1=1 
+                and district_name like 'THÀNH PHỐ THỦ ĐỨC' 
+                and province_code = '79' 
+                and ward_name not in ('KHÁC','TẤT CẢ') 
+        ) as a
+    left join
+        (
+            select 
+                    id as id_old,
+                    ward_name,
+                    district_code, 
+                    district_name 
+            from  hive.comp_base.dim_location_v1  
+            where 1=1 
+                and district_code in ('762','763','769') 
+                and province_code = '79' 
+                and district_name not like 'THÀNH PHỐ THỦ ĐỨC' 
+                and ward_name not in ('KHÁC','TẤT CẢ') 
+        ) as b on a.ward_name = b.ward_name
+),
+
+h2 as 
+(
+    select
+        created_date,
+        trace_doc_id,
+        doc_type
+    from  hive.company.fact_warehouse_transaction_v2 
+    where 1=1 
+        and doc_type = 'pick'
+        and created_date <= date('2022-12-05')
+        and merchant_id = 232
+        and trace_doc_id is not null
+),
+
+h3 as 
+(
+    select
+        created_date,
+        trace_doc_id,
+        doc_type,
+        tran_id
+    from  hive.company.fact_warehouse_transaction_v2 
+    where 1=1 
+        and doc_type in ('out_return','pack_return','pick_return')
+        and created_date > date('2022-12-05')
+        and merchant_id = 232 
+        and trace_doc_id is not null
+),
+
+g1 as 
+(
+    select 
+        t01.full_name, 
+        coalesce(h01.id_new, t01.location_id) as location_id, 
+        t01.start_date, 
+        t01.end_date, 
+        t01.is_current
+    from gsheets.default.dim_company_employee_input_v2  t01
+    left join h01 
+        on t01.location_id = h01.id_old and t01.is_current = true
+),
+
+h02 AS 
+( 
+    select
+        order_code,
+        sum(amount_novat) as amount_novat
+    from        hive.company.fact_order_created_v2                 a
+    left join   hive.company.fact_warehouse_transaction_v2         d on a.order_id = d.trace_order_id
+    left join   hive.company.fact_warehouse_transaction_detail_v2  e on d.tran_id = e.tran_id 
+    left join   hive.company.dim_product_v2                        p on p.id = e.sku_id
+    where 1=1 
+        and d.order_type = 'don_nhap_hoan_ban'
+        and d.doc_type in ('out_return','pack_return','pick_return') 
+        and (a.terminal_code like '%pos365%'
+            or a.terminal_code like '%company%'
+            or a.terminal_code like '%sapo%' 
+            or p.merchant_id = 232
+            or a.merchant_id = 232)
+    group by 1 
+),
+
+h03 AS 
+(
+    select
+        order_code,
+        sum(amount_novat) as amount_novat
+    from     hive.company.fact_order_created_v2  a
+    left join     hive.company.fact_warehouse_transaction_v2  d on a.order_id = d.trace_order_id
+    left join   hive.company.fact_warehouse_transaction_detail_v2  e on d.tran_id = e.tran_id 
+    left join  hive.company.dim_product_v2  p on p.id = e.sku_id
+    left join h2
+        on d.trace_doc_id  = h2.trace_doc_id
+    left join h3 
+        on d.trace_doc_id = h3.trace_doc_id and d.tran_id = h3.tran_id
+    where 1=1 
+        and case 
+            when d.date <= date('2022-12-05') then d.doc_type IN ('pick') 
+            else d.doc_type IN ('out')
+            end
+        and d.order_type = 'don_xuat_ban'
+        and case 
+            when d.date <= date('2022-12-05') then h2.trace_doc_id is not null
+            else h2.trace_doc_id is null
+            end
+        and (a.terminal_code like '%pos365%'
+            or a.terminal_code like '%company%'
+            or a.terminal_code like '%sapo%' 
+            or p.merchant_id = 232
+            or a.merchant_id = 232)
+    group by 1 
+),
+
+h04 AS 
+(
+    select 
+        distinct 
+        h02.order_code,
+        abs(round(h03.amount_novat - h02.amount_novat, 0)) as order_amount_novat
+    from h02
+    left join h03 
+    on h02.order_code = h03.order_code
+
+    union distinct
+    
+    select 
+        order_code,
+        0 as order_amount_novat
+    from  hive.company.fact_order_created_v2 
+    where 1=1 
+    and parent_id in
+        (
+        select 
+            distinct a.order_code
+        from  hive.company.fact_order_created_v2  a
+        left join  hive.company.fact_warehouse_transaction_v2  t 
+            on a.order_id = t.trace_order_id
+        where 1=1 
+            and t.order_type = 'don_nhap_hoan_ban'
+            and t.merchant_id = 232
+            and a.created_date >= date('2022-11-01')
+            and a.order_type <> 1
+        )
+),
+
+h05 as
+(
+    select 
+        t.trace_doc_id
+    from  hive.company.fact_warehouse_transaction_v2  t 
+    left join  hive.company.fact_warehouse_transaction_v2  t1 
+        on t.previous_tran_id = t1.tran_id
+    where 1=1
+        and t.merchant_id = 232
+        and t.doc_type = 'out_return'
+        and t1.doc_type <> 'out'
+        and t.created_date >= date('2022-12-01')
+), 
+
+d as 
+(
+    select 
+        a.* 
+    from  hive.company.fact_warehouse_transaction_v2  a
+    left join h2 on a.trace_doc_id = h2.trace_doc_id
+    left join h3 on a.trace_doc_id = h3.trace_doc_id and a.tran_id = h3.tran_id
+    where 1=1 
+        and case 
+            when a.date <= date('2022-12-05') then a.doc_type IN ('pick','out_return','pack_return','pick_return')
+            when a.date > date('2022-12-05') and h3.trace_doc_id is not null and h2.trace_doc_id is not null 
+                then a.doc_type in ('out_return','pack_return','pick_return') 
+            else a.doc_type IN ('out','out_return')
+            end
+        and case 
+            when a.date <= date('2022-12-05') then h2.trace_doc_id is not null
+            else h2.trace_doc_id is null
+            end
+        and a.order_type   IN ('don_nhap_hoan_ban','don_xuat_ban')
+        and a.merchant_id = 232 
+), 
+
+e as 
+(
+    select
+        date,
+        tran_id,
+        export_warehouse_id,
+        import_warehouse_id,
+        sku_id,
+        SUM(quantity) AS quantity,
+        SUM(amount) AS amount,
+        SUM(amount_novat) AS amount_novat
+    from   hive.company.fact_warehouse_transaction_detail_v2 
+    where  1=1 
+        and date >= date('2020-01-01')
+    group by
+        date,
+        tran_id,
+        export_warehouse_id,
+        import_warehouse_id,
+        sku_id
+),
+
+h as
+(
+    select
+        distinct a.master_customer_id,
+        min(date_trunc(d.created_date, month)) as min_month,
+        min(date_trunc(d.created_date, year)) as min_year,
+        min(d.created_at) as first_seen
+    from   hive.company.fact_order_created_v2  a
+    left join   hive.company.fact_warehouse_transaction_v2         d on  a.order_id = d.trace_order_id
+    left join  hive.company.fact_warehouse_transaction_detail_v2  dt on dt.tran_id = d.tran_id
+    left join  hive.company.dim_product_v2                         p on p.id = dt.sku_id
+    left join                                                                 h04 on  a.order_code = h04.order_code
+    left join                                                                 h03 on a.order_code = h03.order_code
+    left join                                                                  h2 on d.trace_doc_id  = h2.trace_doc_id
+    left join                                                                  h3 on d.trace_doc_id = h3.trace_doc_id and d.tran_id = h3.tran_id
+    where 1=1 
+        and case 
+            when d.date <= date('2022-12-05') then d.doc_type IN ('pick','out_return','pack_return','pick_return')
+            when d.date > date('2022-12-05') and h3.trace_doc_id is not null and h2.trace_doc_id is not null 
+            then d.doc_type in ('out_return','pack_return','pick_return') 
+            else d.doc_type IN ('out','out_return')
+            end
+        and case 
+            when d.date <= date('2022-12-05') then h2.trace_doc_id is not null
+            else h2.trace_doc_id is null
+            end
+        and d.created_date is not null 
+        and d.created_date >= date('2020-01-01')
+        and d.order_type = 'don_xuat_ban'
+        and (a.terminal_code like '%pos365%'
+            or a.terminal_code like '%company%'
+            or a.terminal_code like '%sapo%' 
+            or p.merchant_id = 232
+            or a.merchant_id = 232)
+        and a.order_type = 1
+        and (h04.order_amount_novat >= 1000000 or h04.order_code is null)
+        and h03.amount_novat >= 1000000
+    group by
+        a.master_customer_id
+), 
+
+t1 as 
+(
+    select distinct
+        name,
+        order_code,
+        is_horeca,
+        row_number() over (partition by order_code order by (select null)) as RowNum
+    from
+    from gsheets.default.namnh_company_additional_order_mapping
+    where 1=1 
+        and order_code is not null
+), 
+
+t2 as 
+(
+    select distinct
+        name,
+        order_code,
+        is_horeca,
+        row_number() over (partition by order_code order by (select null)) as RowNum
+    from gsheets.default.namnh_company_additional_order_mapping
+    where 1=1 
+        and order_code is not null
+), 
+
+mkt_customer as 
+(
+    select 
+        master_customer_id,
+        MIN(created_at) as created_at
+    from
+        (
+            select 
+                distinct
+                master_customer_id,
+                min(a.created_at) as created_at
+            from   hive.company.fact_order_created_v2  a
+            left join  hive.company.dim_order_processing_v2  p on p.order_id = a.order_id
+            left join  hive.comp_base.dim_sale_channel  b on a.sale_channel_id = b.id
+            where 1=1 
+                and (p.payment_confirmed_at is not null or p.delivered_at is not null)
+                and partner_name = 'company'
+                and order_type = 1
+            group by 
+                master_customer_id
+
+            union distinct
+
+            select 
+                distinct
+                master_customer_id,
+                min(a.created_at) as created_at
+            from  hive.company.fact_order_created_v2  a
+            left join  hive.company.fact_order_completed_v2  c on c.order_id = a.order_id
+            left join  hive.comp_base.dim_sale_channel  b on a.sale_channel_id = b.id
+            where 1=1 
+                and (c.payment_confirmed_at is not null or c.delivered_at is not null)
+                and partner_name = 'company'
+                and order_type = 1
+            group by 
+                master_customer_id
+        )
+    group by master_customer_id
+) 
+
+select 
+    distinct
+    a.order_code,
+    coalesce(a.om_order_code, a.parent_id) as om_order_code,
+    a.created_at,
+    a.created_date as created_date_id,
+    a.terminal_code as sell_branch,
+    f.short_name as seller,
+    a.created_date as create_date,
+    a.billing_tax_code,
+    upper(a.billing_name) as billing_name,
+    a.master_customer_id as customer_id,
+    h.master_customer_id as count_merchant_id,
+    case
+        when h.master_customer_id is null then null 
+        when DATE_TRUNC(d.created_date, MONTH) = h.min_month and DATE_TRUNC(d.created_date, YEAR) = h.min_year then 'new'
+        else 'old'
+        end as merchant_type,
+    mkt_customer.master_customer_id as count_merchant_id_mkt_rule,
+    case
+        when mkt_customer.master_customer_id is null then null 
+        when a.created_at = mkt_customer.created_at then 'new'
+        else 'old'
+        end as merchant_type_mkt,
+    h.first_seen,
+    upper(coalesce(l12.shipping_name,a.customer_full_name)) as customer_full_name,
+    coalesce(f1.order_status, f2.order_status) as order_status,
+    coalesce(h01.province_name, l1.province_name) as shipping_province,
+    coalesce(h01.ward_name , l1.ward_name) as shipping_ward,
+    coalesce(h01.district_name , l1.district_name) as shipping_district,
+    coalesce(h01.region , l1.region ) as shipping_region,
+    kr.krv_region,
+    coalesce(h01.id_new , l1.id ) as shipping_location_id,
+    d.created_at as warehouse_date_at,
+    d.created_date as warehouse_date,
+    coalesce(j.delivered_date, i.delivered_date)       as delivered_date,
+    d.order_type,
+    d.doc_id,
+    w2.raw_id as branch_id,
+    w2.name as branch_name,
+    w1.code,
+    w1.name,
+    c.raw_sku_id,
+    c.name AS sku_name,                         
+    c.brand_id, 
+    c.brand_name,
+    if(d.order_type = 'don_xuat_ban', e.quantity,  -e.quantity) as quantity,
+    if(d.order_type = 'don_xuat_ban', e.amount, -e.amount) as amount,
+    if(d.order_type = 'don_xuat_ban', e.amount_novat, -e.amount_novat) as amount_novat,
+    if(d.order_type = 'don_xuat_ban', e.quantity * m.cogs_per_unit_novat, - e.quantity * m.cogs_per_unit_novat) as cogs_novat,
+    if(d.order_type = 'don_xuat_ban', e.quantity * m.weighted_cogs_per_unit_novat, - e.quantity * m.weighted_cogs_per_unit_novat) as weighted_cogs_novat,
+    JSON_EXTRACT_SCALAR( coalesce(f1.payment_info, f2.payment_info),'$[0].payment_method') as payment_method,
+    a.coupon_code,
+    a.coupon_amount,
+    coalesce(f1.code_3pl , f2.code_3pl) as code_3pl,
+    c1.cat_lv1_id as seller_cat_lv1_id, 
+    c1.cat_lv1_name as seller_cat_lv1_name, 
+    th.Cate_Group_Description_EN as seller_cat_lv1_eng,
+    c1.cat_lv2_id as seller_cat_lv2_id, 
+    c1.cat_lv2_name as seller_cat_lv2_name, 
+    th.Sub_cat_lv1_description_EN as seller_cat_lv2_eng,
+    c1.cat_lv3_id as seller_cat_lv3_id, 
+    c1.cat_lv3_name as seller_cat_lv3_name,
+    th.Sub_cat_lv2_description_EN as seller_cat_lv3_eng,
+    dev2.email as dealer_email,
+    dev2.full_name as dealer_name
+from  hive.company.fact_order_created_v2                      a 
+left join                                                                  d  on  a.order_id = d.trace_order_id 
+left join                                                                  e  on  d.tran_id = e.tran_id 
+left join   gsheets.default.customer_name_fix                             l12 on l12.order_id = a.order_code
+left join   hive.company.dim_product_v2                        c on  e.sku_id = c.id
+left join   hive.company.dim_product_category_v2              c1 on  e.sku_id = c1.sku_id and c1.platform_id = 6
+left join   hive.company.fact_order_completed_v2              i  on  a.order_id                                    = i.order_id
+left join   hive.company.dim_order_processing_v2              j  on  a.order_id                                    = j.order_id                                                                  
+left join   hive.company.fact_order_completed_v2              f1 on  a.order_id = f1.order_id
+left join   hive.company.dim_order_processing_v2              f2 on  a.order_id = f2.order_id                                                               
+left join   hive.comp_base.dim_location_v1                        l1 on  coalesce(f1.shipping_location_id,f2.shipping_location_id)  = l1.id
+left join                                                                 h01 on l1.id = h01.id_old
+left join   hive.company.dim_warehouse_v2                     w1 on  if(d.order_type = 'don_xuat_ban', e.export_warehouse_id, e.import_warehouse_id) = w1.id
+left join   hive.company.dim_shop_v2                          w2 on  w1.shop_id             = w2.id
+left join   hive.company.dim_merchant_v2                      f  on  a.merchant_id = f.id
+left join   gsheets.default.dim_company_employee                           g  on  l1.province_name = g.province
+                                                                                and l1.district_name = g.district
+                                                                                and a.created_date >= PARSE_DATE('%Y%m%d', cast( g.start_date as VARCHAR))
+                                                                                and a.created_date <= PARSE_DATE('%Y%m%d', cast( g.end_date as VARCHAR))
+left join                                                                  g1 on  coalesce(h01.id_new, l1.id) = g1.location_id
+                                                                                and a.created_date >= PARSE_DATE('%Y%m%d', cast( g1.start_date as VARCHAR))
+                                                                                and a.created_date <= PARSE_DATE('%Y%m%d', cast( g1.end_date as VARCHAR))                                                                        
+left join                                                                   h on a.master_customer_id = h.master_customer_id
+left join   gsheets.default.dim_company_telesales_order_input               t on a.parent_code = t.order_code
+left join                                                                  t1 on   a.parent_code = t1.order_code 
+                                                                                and t1.RowNum = 1
+left join                                                                  t2 on   a.om_order_code = t2.order_code 
+                                                                                and t2.RowNum = 1
+left join                                                        mkt_customer on mkt_customer.master_customer_id = a.master_customer_id
+left join   gsheets.default.nam_company_vnng_orders                       v on a.parent_code = v.order_code
+left join   nam_order_cogs                  m on d.created_date         =m.date
+                                                                                and e.sku_id       = m.sku_id
+                                                                                and a.merchant_id  = m.merchant_id
+left join   gsheets.default.hao_company_order_salesman_ultimate_priority    u on (a.order_code = u.order_code or a.om_order_code = u.order_code) 
+left join   gsheets.default.thuyptn_krv_hierachy_en                        th on c1.cat_lv3_id = th.Sub_cat_lv2_ID
+left join   gsheets.default.nam_company_location_region                  kr on l1.province_name = kr.province_name
+left join   hive.company.dim_employee_v2                    dev2 on a.consultant_employee_id = dev2.id
+left join                                                                 h05 on h05.trace_doc_id = d.trace_doc_id
+where 1=1 
+    and (a.terminal_code like '%pos365%'
+        or a.terminal_code like '%company%'
+        or a.terminal_code like '%sapo%' 
+        or c.merchant_id = 232
+        or a.merchant_id = 232)
+    and a. order_type = 1
+    and d.created_date is not null
+    and h05.trace_doc_id is null
